@@ -52,19 +52,19 @@ type Cache interface {
 	Delete(key string)
 }
 
-// cacheKey returns the cache key for req.
-func cacheKey(req *http.Request) string {
+// defaultKeyFunc returns the cache key for req.
+func defaultKeyFunc(req *http.Request) (string, bool) {
+	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
 	if req.Method == http.MethodGet {
-		return req.URL.String()
-	} else {
-		return req.Method + " " + req.URL.String()
+		return req.URL.String(), cacheable
 	}
+	return req.Method + " " + req.URL.String(), cacheable
 }
 
 // CachedResponse returns the cached http.Response for req if present, and nil
 // otherwise.
-func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error) {
-	cachedVal, ok := c.Get(cacheKey(req))
+func CachedResponse(c Cache, key string, req *http.Request) (resp *http.Response, err error) {
+	cachedVal, ok := c.Get(key)
 	if !ok {
 		return
 	}
@@ -73,7 +73,7 @@ func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error)
 	return http.ReadResponse(bufio.NewReader(b), req)
 }
 
-// MemoryCache is an implemtation of Cache that stores responses in an in-memory map.
+// MemoryCache is an implementation of Cache that stores responses in an in-memory map.
 type MemoryCache struct {
 	mu    sync.RWMutex
 	items map[string][]byte
@@ -119,6 +119,8 @@ type Transport struct {
 	MarkCachedResponses bool
 	// cacheableResponseCodes holds the set of cacheable response codes
 	cacheableResponseCodes map[int]struct{}
+	// keyFunc generates the cache key and the information if the request can be cached from the provided request
+	keyFunc func(*http.Request) (string, bool)
 }
 
 // Opt is a config option func
@@ -131,6 +133,13 @@ func WithCacheableResponseCodes(codes map[int]struct{}) Opt {
 	}
 }
 
+// WithKeyFunc configures the function that retrieves the cache key and the cacheable status from the request
+func WithKeyFunc(f func(*http.Request) (string, bool)) Opt {
+	return func(t *Transport) {
+		t.keyFunc = f
+	}
+}
+
 // NewTransport returns a new Transport with the
 // provided Cache implementation and MarkCachedResponses set to true
 func NewTransport(c Cache, opts ...Opt) *Transport {
@@ -138,6 +147,7 @@ func NewTransport(c Cache, opts ...Opt) *Transport {
 		Cache:                  c,
 		MarkCachedResponses:    true,
 		cacheableResponseCodes: defaultCacheableResponseCodes,
+		keyFunc:                defaultKeyFunc,
 	}
 	for _, o := range opts {
 		o(tr)
@@ -171,11 +181,10 @@ func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 // to give the server a chance to respond with NotModified. If this happens, then the cached Response
 // will be returned.
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	cacheKey := cacheKey(req)
-	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
+	cacheKey, cacheable := t.keyFunc(req)
 	var cachedResp *http.Response
 	if cacheable {
-		cachedResp, err = CachedResponse(t.Cache, req)
+		cachedResp, err = CachedResponse(t.Cache, cacheKey, req)
 	} else {
 		// Need to invalidate an existing value
 		t.Cache.Delete(cacheKey)
